@@ -2,14 +2,13 @@ package com.fourcasters.forec.reconciler.query;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.TreeMap;
 import java.util.Map.Entry;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public abstract class IndexableDAO {
 
@@ -19,6 +18,7 @@ public abstract class IndexableDAO {
 	public abstract RecordBuilder getRecordBuilder(String recordFormat);
 	public abstract RecordBuilder getRecordBuilder();
 	public abstract void onIndexingEnd(String cross);
+	public abstract String getDefaultFormat();
 
 	protected TreeMap<Long, Long> javaDbHash(String cross) throws IOException {
 		String format = getDefaultFormat();
@@ -29,81 +29,23 @@ public abstract class IndexableDAO {
 		cross = cross.toLowerCase();
 		TreeMap<Long, Long> hash = new TreeMap<>();
 		final Path path = getFilePath(cross);
-		try(RandomAccessFile sc = new RandomAccessFile(path.toFile(), "r");){
-			String recordAsString;
-			RecordBuilder recordBuilder = getRecordBuilder(recordFormat);
-
-			byte[] buff = new byte[4096];
-			boolean finished = false;
-			int rem = 0;
-			long totalBytes = 0;
-			Record prev = null;
-			while (!finished) {
-				int bytesRead = sc.read(buff, rem, 4096);
-				ByteBuffer bb = ByteBuffer.wrap(buff);
-				while ((recordAsString = readLine(bb)) != null) {
-					Record curr = recordBuilder.newRecord(recordAsString);
-					if (!curr.hasToIndex(prev)) {
-						hash.put(curr.index(), totalBytes);
-					}
-					prev = curr;
-					totalBytes += (recordAsString.length() + 2); // /r/n
+		RecordBuilder recordBuilder = getRecordBuilder(recordFormat);
+		new BufferedFileParser() {
+			@Override
+			protected boolean onNewRecord(Record curr, Record prev, long bytesReadSoFar, int recordLength) {
+				if (!curr.shouldIndex(prev)) {
+					hash.put(curr.index(), bytesReadSoFar);
 				}
-				rem = 0;
-				if (bb.remaining() > 0 ) {
-					rem = bb.remaining();
-				}
-				buff = new byte[4096+rem];
-				bb.get(buff, 0 , rem);
-				if (bytesRead < 4096) {
-					finished = true;
-				}
+				return true;
 			}
-		}
-		onIndexingEnd(cross);
+		}.walkThroughFile(path, 0, recordBuilder);
 		return hash;
 	}
 
-	final String readLine(ByteBuffer bb) throws IOException {
-		StringBuilder input = new StringBuilder();
-		int c = -1;
-		boolean eol = false;
-		while (!eol) {
-			if (!bb.hasRemaining()) {
-				break;
-			}
-			switch ((c = bb.get())) {
-			case -1:
-			case '\n':
-				eol = true;
-				break;
-			case '\r':
-				if (bb.hasRemaining()) {
-					eol = true;
-					if ((bb.get()) != '\n') {
-						throw new RuntimeException();
-					}
-					break;
-				}
-				input.append((char)c);
-				break;
-			default:
-				input.append((char)c);
-				break;
-			}
-		}
-		if (!eol) {
-			bb.position(bb.limit() - input.length());
-			return null;
-		}
-		if ((c == -1) && (input.length() == 0)) {
-			return null;
-		}
-		return input.toString();
-	}
-
 	public boolean dbhash(String cross, String format) throws IOException {
-		return indexes.put(cross, javaDbHash(cross, format)) == null;
+		boolean result = indexes.put(cross, javaDbHash(cross, format)) == null;
+		onIndexingEnd(cross);
+		return result;
 	}
 	public boolean dbhash(String cross) throws IOException {
 		return indexes.put(cross, javaDbHash(cross)) == null;
@@ -127,24 +69,23 @@ public abstract class IndexableDAO {
 		if (checkpoint == null) {
 			return -1;
 		}
-		long offset = -1;
-		boolean found = false;
 		final Path path = getFilePath(cross);
-		try(RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r");) {
-			RecordBuilder hrb = getRecordBuilder();
-			raf.seek(checkpoint.getValue());
-			String recordAsString;
-			while (!found && (recordAsString = raf.readLine()) != null) {
-				Record record = hrb.newRecord(recordAsString);
-				if (record.index() >= timestamp) {
-					found = true;
-					offset = exact ? raf.getFilePointer()
-							: raf.getFilePointer() - recordAsString.length() - 2;
+		RecordBuilder hrb = getRecordBuilder();
+		final AtomicLong offset = new AtomicLong(-1);
+		new BufferedFileParser() {
+			@Override
+			protected boolean onNewRecord(Record curr, Record prev, long bytesReadSoFar, int recordLength) {
+				if (curr.index() >= timestamp) {
+					offset.set(exact ? bytesReadSoFar + recordLength
+									 : bytesReadSoFar);
+					return false;
 				}
+				return true;
 			}
-		}
-		return offset;
+		}.walkThroughFile(path, checkpoint.getValue(), hrb);
+		return offset.get();
 	}
+
 	public abstract Path getRootPath();
 
 	public void dbhashAll(String format) throws IOException {
@@ -161,8 +102,6 @@ public abstract class IndexableDAO {
 			dbhash(cross, format);
 		}
 	}
-	public abstract String getDefaultFormat();
-
 
 	public void dbhashAll() throws IOException {
 		String format = getDefaultFormat();

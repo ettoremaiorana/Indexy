@@ -1,9 +1,9 @@
 package com.fourcasters.forec.reconciler.query;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -13,13 +13,13 @@ import java.util.function.BiFunction;
 
 public abstract class IndexableDAO {
 
-	private static final BiFunction <Long, Integer, Long> projectFirst = new BiFunction<Long, Integer, Long>() {
+	protected static final BiFunction <Long, Integer, Long> projectFirst = new BiFunction<Long, Integer, Long>() {
 		@Override
 		public Long apply(Long t, Integer u) {
 			return t;
 		}
 	};
-	private static final BiFunction<Long, Integer, Long> sum = new BiFunction<Long, Integer, Long>() {
+	protected static final BiFunction<Long, Integer, Long> sum = new BiFunction<Long, Integer, Long>() {
 		@Override
 		public Long apply(Long t, Integer u) {
 			return t + u.longValue();
@@ -32,22 +32,28 @@ public abstract class IndexableDAO {
 	public abstract RecordBuilder getRecordBuilder(String recordFormat);
 	public abstract RecordBuilder getRecordBuilder();
 	public abstract void onIndexingEnd(String cross);
-	public abstract String getDefaultFormat();
 
 	protected TreeMap<Long, Long> createIndex0(String cross) throws IOException {
-		String format = getDefaultFormat();
-		return createdIndex0(cross, format);
+		return createdIndex0(cross);
 	}
 
+	protected TreeMap<Long, Long> createdIndex0(String cross) throws IOException {
+		RecordBuilder recordBuilder = getRecordBuilder();
+		return createIndex1(cross, recordBuilder);
+	}
 	protected TreeMap<Long, Long> createdIndex0(String cross, String recordFormat) throws IOException {
-		cross = cross.toLowerCase();
+		RecordBuilder recordBuilder = getRecordBuilder(recordFormat);
+		return createIndex1(cross, recordBuilder);
+	}
+	private TreeMap<Long, Long> createIndex1(String cross, RecordBuilder recordBuilder)
+			throws IOException, FileNotFoundException {
+
 		TreeMap<Long, Long> hash = new TreeMap<>();
 		final Path path = getFilePath(cross);
-		RecordBuilder recordBuilder = getRecordBuilder(recordFormat);
 		new BufferedFileParser() {
 			@Override
 			protected boolean onNewRecord(Record curr, Record prev, long bytesReadSoFar, int recordLength) {
-				if (!curr.shouldIndex(prev)) {
+				if (curr.shouldIndex(prev)) {
 					hash.put(curr.index(), bytesReadSoFar);
 				}
 				return true;
@@ -72,8 +78,11 @@ public abstract class IndexableDAO {
 		return index.size();
 	}
 
-	private long offset(String cross, Date date, BiFunction<Long, Integer, Long> f) throws IOException {
-		long timestamp = date.getTime();
+	protected final long offset(String cross, long toSearch) throws IOException {
+		return offset(cross, toSearch, projectFirst);
+	}
+	protected final long offset(String cross, long toSearch, BiFunction<Long, Integer, Long> f) throws IOException {
+		long timestamp = toSearch;
 
 		TreeMap<Long, Long> index = indexes.get(cross);
 		if (index == null) {
@@ -98,31 +107,67 @@ public abstract class IndexableDAO {
 		}.walkThroughFile(path, checkpoint.getValue(), hrb);
 		return offset.get();
 	}
-
-	public long offset(String cross, Date date) throws IOException {
-		return offset(cross, date, projectFirst);
+	protected final long offsetExact(String cross, long toSearch) throws IOException {
+		return offsetExact(cross, toSearch, projectFirst);
 	}
+	protected final long offsetExact(String cross, long toSearch, BiFunction<Long, Integer, Long> f) throws IOException {
+		long timestamp = toSearch;
 
-	public long offsetPlusOne(String cross, Date date) throws IOException {
-		return offset(cross, date, sum);
-	}
-	public void createIndexAll(String format) throws IOException {
-		final File root = getRootPath().toFile();
-		if (!root.isDirectory()) {
-			throw new IllegalArgumentException("Unable to read table files from non directory " + root);
+		TreeMap<Long, Long> index = indexes.get(cross);
+		if (index == null) {
+			return -1;
 		}
-		for(File f : root.listFiles()) {
-			String cross = f.getName();
-			int pos = cross.lastIndexOf(".");
-			if (pos > 0) {
-				cross = cross.substring(0, pos);
+		Entry<Long, Long> checkpoint = index.floorEntry(timestamp);
+		if (checkpoint == null) {
+			return -1;
+		}
+		final Path path = getFilePath(cross);
+		RecordBuilder hrb = getRecordBuilder();
+		final AtomicLong offset = new AtomicLong(-1);
+		new BufferedFileParser() {
+			@Override
+			protected boolean onNewRecord(Record curr, Record prev, long bytesReadSoFar, int recordLength) {
+				if (curr.index() == timestamp) {
+					offset.set(f.apply(bytesReadSoFar, recordLength));
+					return false;
+				}
+				if (curr.index() > timestamp) {
+					return true;
+				}
+				return true;
 			}
-			createIndex(cross, format);
+		}.walkThroughFile(path, checkpoint.getValue(), hrb);
+		return offset.get();
+	}
+
+	public void createIndexAll(String format) throws IOException {
+		final File root = validateRootFolder();
+		for(File f : root.listFiles()) {
+			String table = validateAndGetTableName(f);
+			createIndex(table, format);
 		}
 	}
 
 	public void createIndexAll() throws IOException {
-		String format = getDefaultFormat();
-		createIndexAll(format);
+		final File root = validateRootFolder();
+		for(File f : root.listFiles()) {
+			String table = validateAndGetTableName(f);
+			createIndex(table);
+		}
+	}
+	private String validateAndGetTableName(File f) {
+		String table = f.getName();
+		int pos = table.lastIndexOf(".");
+		if (pos > 0) {
+			table = table.substring(0, pos);
+		}
+		return table;
+	}
+	private File validateRootFolder() {
+		final File root = getRootPath().toFile();
+		if (!root.isDirectory()) {
+			throw new IllegalArgumentException("Unable to read table files from non directory " + root);
+		}
+		return root;
 	}
 }
